@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Backend, CloudBackend, LocalBackend};
+use super::{Backend, BackendSelectionSource, CloudBackend, LocalBackend};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -119,7 +119,12 @@ pub fn resolve_default_backend() -> MicrosandboxResult<Arc<dyn Backend>> {
     // Tier 2a: explicit backend kind via env.
     let explicitly_cloud = if let Ok(kind) = std::env::var("MSB_BACKEND") {
         match kind.trim().to_ascii_lowercase().as_str() {
-            "local" => return Ok(Arc::new(LocalBackend::lazy())),
+            "local" => {
+                return Ok(Arc::new(LocalBackend::lazy_with_selection(
+                    BackendSelectionSource::MsbBackend,
+                    None,
+                )));
+            }
             // Fall through to direct credentials or profile lookup. Keeping
             // this bit lets us reject an explicit cloud request that resolves
             // to neither instead of silently treating its URL as a signal.
@@ -140,16 +145,21 @@ pub fn resolve_default_backend() -> MicrosandboxResult<Arc<dyn Backend>> {
         std::env::var("MSB_API_URL").ok(),
         std::env::var("MSB_API_KEY").ok(),
     )? {
-        return Ok(Arc::new(cloud));
+        let source = if explicitly_cloud {
+            BackendSelectionSource::MsbBackend
+        } else {
+            BackendSelectionSource::MsbApiKey
+        };
+        return Ok(Arc::new(cloud.with_selection(source, None)));
     }
 
     // Tier 3 / 4: profile selection via env or config file.
     let cfg = load_sdk_config()?;
-    let profile_name = std::env::var("MSB_PROFILE")
+    let env_profile = std::env::var("MSB_PROFILE")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| cfg.active_profile.clone());
+        .filter(|s| !s.is_empty());
+    let profile_name = env_profile.clone().or_else(|| cfg.active_profile.clone());
 
     if let Some(name) = profile_name {
         let profile = cfg.profiles.get(&name).ok_or_else(|| {
@@ -162,7 +172,14 @@ pub fn resolve_default_backend() -> MicrosandboxResult<Arc<dyn Backend>> {
                 "MSB_BACKEND=cloud cannot select local profile {name:?}"
             )));
         }
-        return backend_from_profile(&name, profile);
+        let source = if explicitly_cloud {
+            BackendSelectionSource::MsbBackend
+        } else if env_profile.is_some() {
+            BackendSelectionSource::MsbProfile
+        } else {
+            BackendSelectionSource::ActiveProfile
+        };
+        return backend_from_profile(&name, profile, source);
     }
 
     if explicitly_cloud {
@@ -172,14 +189,27 @@ pub fn resolve_default_backend() -> MicrosandboxResult<Arc<dyn Backend>> {
     }
 
     // Tier 5: local fallback.
-    Ok(Arc::new(LocalBackend::lazy()))
+    Ok(Arc::new(LocalBackend::lazy_with_selection(
+        BackendSelectionSource::Default,
+        None,
+    )))
 }
 
 /// Build a backend instance from a named profile.
-fn backend_from_profile(name: &str, profile: &Profile) -> MicrosandboxResult<Arc<dyn Backend>> {
+fn backend_from_profile(
+    name: &str,
+    profile: &Profile,
+    source: BackendSelectionSource,
+) -> MicrosandboxResult<Arc<dyn Backend>> {
     match profile.backend {
-        ProfileBackend::Local => Ok(Arc::new(LocalBackend::lazy())),
-        ProfileBackend::Cloud => Ok(Arc::new(cloud_backend_from_profile_parts(name, profile)?)),
+        ProfileBackend::Local => Ok(Arc::new(LocalBackend::lazy_with_selection(
+            source,
+            Some(name.to_string()),
+        ))),
+        ProfileBackend::Cloud => Ok(Arc::new(
+            cloud_backend_from_profile_parts(name, profile)?
+                .with_selection(source, Some(name.to_string())),
+        )),
     }
 }
 
@@ -188,7 +218,8 @@ pub(crate) fn cloud_backend_from_profile(name: &str) -> MicrosandboxResult<Cloud
     let profile = cfg.profiles.get(name).ok_or_else(|| {
         MicrosandboxError::InvalidConfig(format!("profile {name:?} not found in SDK config"))
     })?;
-    cloud_backend_from_profile_parts(name, profile)
+    Ok(cloud_backend_from_profile_parts(name, profile)?
+        .with_selection(BackendSelectionSource::Profile, Some(name.to_string())))
 }
 
 fn cloud_backend_from_profile_parts(
@@ -318,6 +349,8 @@ fn sdk_config_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn sdk_config_parses_minimal() {
         let json = r#"{
@@ -409,8 +442,10 @@ mod tests {
             url: None,
             api_key_ref: None,
         };
-        let b = backend_from_profile("local", &p).unwrap();
+        let b = backend_from_profile("local", &p, BackendSelectionSource::MsbProfile).unwrap();
         assert_eq!(b.kind(), super::super::BackendKind::Local);
+        assert_eq!(b.info().source, BackendSelectionSource::MsbProfile);
+        assert_eq!(b.info().profile.as_deref(), Some("local"));
     }
 
     #[test]
@@ -420,8 +455,10 @@ mod tests {
             url: Some("https://msb.example.com".into()),
             api_key_ref: Some("inline:msb_live_abc".into()),
         };
-        let b = backend_from_profile("prod", &p).unwrap();
+        let b = backend_from_profile("prod", &p, BackendSelectionSource::ActiveProfile).unwrap();
         assert_eq!(b.kind(), super::super::BackendKind::Cloud);
+        assert_eq!(b.info().source, BackendSelectionSource::ActiveProfile);
+        assert_eq!(b.info().profile.as_deref(), Some("prod"));
     }
 
     #[test]
@@ -458,6 +495,7 @@ mod tests {
 
     #[test]
     fn resolve_default_backend_honors_explicit_local_over_cloud_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("MSB_BACKEND", " local ");
             std::env::set_var("MSB_API_URL", "https://msb.example.com");
@@ -473,6 +511,30 @@ mod tests {
         }
 
         assert_eq!(b.kind(), super::super::BackendKind::Local);
+        assert_eq!(b.info().source, BackendSelectionSource::MsbBackend);
+    }
+
+    #[test]
+    fn explicit_cloud_without_credentials_fails_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MSB_BACKEND", "cloud");
+            std::env::remove_var("MSB_API_KEY");
+            std::env::remove_var("MSB_PROFILE");
+            std::env::set_var("MSB_CONFIG_PATH", "/definitely/missing/msb-config.json");
+        }
+
+        let error = match resolve_default_backend() {
+            Ok(_) => panic!("explicit cloud selection must not fall back to local"),
+            Err(error) => error,
+        };
+
+        unsafe {
+            std::env::remove_var("MSB_BACKEND");
+            std::env::remove_var("MSB_CONFIG_PATH");
+        }
+
+        assert!(error.to_string().contains("MSB_BACKEND=cloud requires"));
     }
 
     #[test]
@@ -493,6 +555,6 @@ mod tests {
             url: Some("https://msb.example.com".into()),
             api_key_ref: None,
         };
-        assert!(backend_from_profile("prod", &p).is_err());
+        assert!(backend_from_profile("prod", &p, BackendSelectionSource::ActiveProfile).is_err());
     }
 }

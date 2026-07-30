@@ -2175,8 +2175,13 @@ pub unsafe extern "C" fn msb_sandbox_create(
             } else {
                 builder.create().await?
             };
+            let backend_kind = sandbox.backend_kind().as_str();
             let handle = register(sandbox)?;
-            Ok(format!(r#"{{"handle":{handle}}}"#))
+            Ok(serde_json::json!({
+                "handle": handle,
+                "backend_kind": backend_kind,
+            })
+            .to_string())
         }))
     })
 }
@@ -2311,6 +2316,7 @@ pub unsafe extern "C" fn msb_sandbox_lookup(
                 "config_json": h.config_json(),
                 "created_at_unix": h.created_at().map(|t| t.timestamp()),
                 "updated_at_unix": h.updated_at().map(|t| t.timestamp()),
+                "backend_kind": h.backend_kind().as_str(),
             })
             .to_string())
         }))
@@ -2336,8 +2342,13 @@ pub unsafe extern "C" fn msb_sandbox_connect(
         let name = unsafe { cstr(name) }?;
         Ok(Box::pin(async move {
             let sb = Sandbox::get(&name).await?.connect().await?;
+            let backend_kind = sb.backend_kind().as_str();
             let handle = register(sb)?;
-            Ok(format!(r#"{{"handle":{handle}}}"#))
+            Ok(serde_json::json!({
+                "handle": handle,
+                "backend_kind": backend_kind,
+            })
+            .to_string())
         }))
     })
 }
@@ -2368,8 +2379,13 @@ pub unsafe extern "C" fn msb_sandbox_start(
             } else {
                 h.start().await.map_err(FfiError::from)?
             };
+            let backend_kind = sb.backend_kind().as_str();
             let handle = register(sb)?;
-            Ok(format!(r#"{{"handle":{handle}}}"#))
+            Ok(serde_json::json!({
+                "handle": handle,
+                "backend_kind": backend_kind,
+            })
+            .to_string())
         }))
     })
 }
@@ -2919,10 +2935,11 @@ fn sandbox_handle_json(h: &microsandbox::sandbox::SandboxHandle) -> String {
         None => "null".to_string(),
     };
     format!(
-        r#"{{"name":{name},"status":"{status}","config_json":{config},"created_at_unix":{created},"updated_at_unix":{updated}}}"#,
+        r#"{{"name":{name},"status":"{status}","config_json":{config},"created_at_unix":{created},"updated_at_unix":{updated},"backend_kind":"{backend_kind}"}}"#,
         name = name_json,
         status = sandbox_status_str(h.status_snapshot()),
         config = cfg_json,
+        backend_kind = h.backend_kind().as_str(),
     )
 }
 
@@ -4979,6 +4996,18 @@ pub unsafe extern "C" fn msb_version(buf: *mut c_uchar, buf_len: usize) -> *mut 
     run(buf, buf_len, || {
         let v = env!("CARGO_PKG_VERSION");
         Ok(format!(r#"{{"version":"{v}"}}"#))
+    })
+}
+
+/// Return secret-safe information about the active default backend.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_default_backend_info(
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run(buf, buf_len, || {
+        serde_json::to_string(&microsandbox::default_backend_info())
+            .map_err(|error| FfiError::internal(format!("serialize backend info: {error}")))
     })
 }
 

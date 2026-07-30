@@ -849,6 +849,8 @@ export declare class Sandbox {
    * Sandbox names are limited to 128 UTF-8 bytes.
    */
   static remove(name: string): Promise<void>
+  /** Backend retained by this sandbox (`"local"` or `"cloud"`). */
+  get backendKind(): string
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
   get name(): Promise<string>
   /** Whether this handle owns the sandbox lifecycle (attached mode). */
@@ -1212,6 +1214,8 @@ export declare class SandboxHandle {
   get name(): string
   /** Status at time of query: "running", "stopped", "crashed", or "draining". */
   get status(): string
+  /** Backend retained by this handle (`"local"` or `"cloud"`). */
+  get backendKind(): string
   /** Raw config JSON string from the database. */
   get configJson(): string
   /** Return a fresh handle for the same sandbox. */
@@ -1658,6 +1662,9 @@ export interface AttachOptions {
   rlimits: Array<JsRlimit>
 }
 
+/** Return secret-safe information about the active default backend. */
+export declare function defaultBackendInfo(): JsBackendInfo
+
 /** Return the active default backend kind (`"local"` or `"cloud"`). */
 export declare function defaultBackendKind(): string
 
@@ -1818,6 +1825,14 @@ export declare function install(): Promise<void>
 
 /** Check if msb and libkrunfw are installed and available. */
 export declare function isInstalled(): boolean
+
+/** Secret-safe backend diagnostics returned to JavaScript. */
+export interface JsBackendInfo {
+  kind: string
+  apiUrl?: string
+  source: string
+  profile?: string
+}
 
 /** One page returned by `Sandbox.list` / `Sandbox.listWith`. */
 export interface JsSandboxPage {
