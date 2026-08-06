@@ -132,13 +132,15 @@ class MicrosandboxIntegrationTest < Test::Unit::TestCase
 
   def assert_eventually(message, timeout: 10)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-    loop do
-      value = yield
-      return assert_true(value) if value
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      begin
+        value = yield
+        return assert_true(value) if value
+      rescue Microsandbox::Error
+        return assert_true(true)
+      end
 
       sleep 0.1
-    rescue Microsandbox::Error
-      return assert_true(true)
     end
 
     flunk("timed out waiting for #{message}")
